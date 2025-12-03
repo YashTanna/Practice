@@ -1,0 +1,285 @@
+Flow & logic — Leave Management System (end-to-end)
+
+Nice — below is a clear, implementable flow of how the app should behave: from an employee creating a leave request, through HR partial/full approval, to payroll (salary slip) generation. I include the required validations, where data is stored (which entity), sample REST endpoints, transaction boundaries, and important edge cases.
+
+High-level steps (short)
+
+Employee opens UI → creates a leave request (fromDate, toDate, leaveType, reason).
+
+Backend computes requestedDays (business days or calendar days rule), validates balance and rules, and inserts a LeaveRequest (status = PENDING).
+
+HR (or approver) views pending requests and acts: APPROVE fully, REJECT, or PARTIALLY_APPROVE (approve a subset of days). Each action creates a LeaveApproval linked to the LeaveRequest.
+
+When approval changes, service updates LeaveRequest.status and updates EmployeeLeaveBalance.usedDays for the relevant year(s) (transactionally).
+
+Payroll job (or payroll UI) queries approved leave days in a month and generates SalarySlip applying unpaid leave deductions. SalarySlip saves the impacted LeaveRequest references.
+
+Entities touched (reminder)
+
+Employee → stores user + roles (enum).
+
+LeaveRequest → the request row (fromDate, toDate, requestedDays, leaveType, status).
+
+LeaveApproval → approval actions (approvedDays, approvedFrom/To, rejected, approver, comment).
+
+EmployeeLeaveBalance → yearly entitlements and usedDays.
+
+SalarySlip → monthly payroll output (paid/unpaid days, deductions).
+
+1) Creating a leave request (employee flow)
+
+UI action: employee fills fromDate, toDate, leaveType, reason → clicks “Submit”.
+
+Backend endpoint (example):
+
+POST /api/leaves
+Body: { "fromDate":"2025-12-20", "toDate":"2025-12-22", "leaveType":"SICK", "reason":"fever" }
+
+
+Service-level steps (CreateLeaveRequest):
+
+Authenticate employee (get Employee id).
+
+Validate dates (fromDate <= toDate, not in past if policy prevents, max contiguous days limit).
+
+Compute requestedDays:
+
+Decide rule: calendar days or business days (exclude weekends and company holidays). Implement utility BusinessDayUtils.countBusinessDays(fromDate, toDate, holidays).
+
+Allow fractional days if your UI supports half-day.
+
+Optional pre-check: if leaveType is SICK/CASUAL, you MAY warn if requestedDays > remaining balance (but still allow submission so HR can override) — or you can disallow if policy requires strict balance enforcement. (Design decision.)
+
+Create LeaveRequest with requestedDays, status = PENDING, requestedAt = now, link to employee. Persist.
+
+Send notification to approver(s) / HR (email or in-app).
+
+Saved entities: leave_requests row inserted; nothing yet deducted from balance until approval.
+
+2) HR views & decides (approval flow)
+
+UI: HR opens “Pending Leaves” → sees list of requests with computed days and employee info.
+
+Important: HR must be able to:
+
+Approve full request (approve all requestedDays).
+
+Reject (approve 0 days → mark rejected).
+
+Partially approve: e.g., employee requested 5 days but HR approves only 3 days or approves specific sub-range (e.g., approve 20–22 Dec out of 18–22 Dec).
+
+Endpoint examples:
+
+POST /api/leaves/{id}/approve
+Body: { "approverId": 10, "approvedFrom": "2025-12-20", "approvedTo":"2025-12-22", "approvedDays": 3, "comment":"Approved 3 days" }
+
+POST /api/leaves/{id}/reject
+Body: { "approverId": 10, "comment":"Can't approve due to workload" }
+
+
+Service-level steps (ApproveLeave) — must be transactional:
+
+Load LeaveRequest (for update if needed). Check current status. If already fully approved/rejected, return error.
+
+Create LeaveApproval record with approvedDays, approvedFrom/approvedTo, approver, comment, approvedAt = now, resultingStatus (set to APPROVED/PARTIALLY_APPROVED/REJECTED). Persist it.
+
+If approvedDays > 0 and leaveType is SICK/CASUAL (paid), then update the EmployeeLeaveBalance rows for each year touched by the approved days:
+
+Determine year(s) for the approved date range (e.g., Dec 2025 may cross to Jan 2026).
+
+For each year, do balance.usedDays += approvedDaysInThatYear. Use optimistic locking (@Version) to avoid race conditions. If insufficient remaining days and policy forbids overdraw, raise error or convert extra days to UNPAID (business rule).
+
+Update LeaveRequest.status:
+
+If totalApprovedDays == requestedDays → APPROVED.
+
+If totalApprovedDays == 0 and last action rejected → REJECTED.
+
+If 0 < totalApprovedDays < requestedDays → PARTIALLY_APPROVED.
+
+Persist all changes in the transaction.
+
+Send notification to employee (approved/partial/rejected) with details of approved days and any comments.
+
+Partial approvals handling:
+
+Each LeaveApproval captures a contiguous approved range (approvedFrom → approvedTo) and approvedDays. For multiple non-contiguous approvals, create multiple LeaveApproval rows.
+
+Alternatively, implement a LeaveDay table for per-day status if you need exact per-date tracking (recommended for complex payroll/attendance integration).
+
+3) Update to leave balances & concurrent safety
+
+Balance update rules:
+
+EmployeeLeaveBalance is unique per employee-year-leaveType. When approving, increment usedDays.
+
+Use optimistic locking (@Version) on EmployeeLeaveBalance to catch concurrent approvals and retry the transaction if OptimisticLockException is thrown.
+
+Validate getRemainingDays() >= approvedDays if your policy forbids negative balances. If allowed, you must decide whether the overflow becomes UNPAID or is refused.
+
+Example transaction pseudo-code:
+
+@Transactional
+approveLeave(requestId, approvalDto) {
+   LeaveRequest lr = leaveRequestRepo.findByIdForUpdate(requestId);
+   if (lr.status == APPROVED) throw;
+
+   LeaveApproval approval = new LeaveApproval(...);
+   approvalRepo.save(approval);
+
+   Map<Integer, Double> daysPerYear = splitApprovedDaysByYear(approval);
+   for (entry : daysPerYear) {
+      EmployeeLeaveBalance bal = balanceRepo.findByEmployeeAndYearAndType(...);
+      if (bal == null) createDefaultBalanceIfNeeded();
+      if (policy.forbidOverdraw && bal.getRemainingDays() < entry.days) throw;
+      bal.usedDays += entry.days;
+      balanceRepo.save(bal);
+   }
+
+   updateLeaveRequestStatus(lr);
+}
+
+4) Payroll / SalarySlip generation
+
+When: monthly payroll run (triggered by scheduled job, manual run by payroll admin, or on-demand when viewing salary for a month).
+
+Goal: Use approved leave data to compute unpaid leave deductions and produce a SalarySlip.
+
+Steps:
+
+For employee X and month M (year Y), fetch all LeaveApproval records (or LeaveRequest approvals) where approved and the approved date range intersects month M. Consider only approvals where rejected == false.
+
+Calculate paidLeaveDays vs unpaidLeaveDays:
+
+If leaveType == UNPAID → all approved days in the month are unpaid.
+
+If leaveType is SICK/CASUAL but balance was insufficient and leftover was treated as unpaid (policy dependent), count accordingly. You may mark approvals to indicate which portion caused unpaid deductions.
+
+Compute deductions = (grossSalary / workingDaysInMonth) * unpaidLeaveDays or use company-specific formula.
+
+Compute netSalary = grossSalary - deductions.
+
+Create SalarySlip entity with year, month, grossSalary, paidLeaveDays, unpaidLeaveDays, deductions, netSalary, and leaveRequests (references). Persist it.
+
+Deliver slip to employee.
+
+Note: If you maintain per-day LeaveDay entries, mapping is exact and simpler.
+
+Example sequences (concrete)
+Full approval example
+
+Employee E submits 5 days SICK (Dec 1–5) → LeaveRequest PENDING saved.
+
+HR approves all 5 days:
+
+Create LeaveApproval with approvedDays=5.
+
+Update EmployeeLeaveBalance for year 2025: usedDays += 5.
+
+LeaveRequest.status → APPROVED.
+
+Payroll: those 5 days are paid (from sick balance) so unpaidLeaveDays=0.
+
+Partial approval example
+
+Employee requests Dec 1–10 (10 days) CASUAL.
+
+HR approves Dec 1–4 (4 days) → create LeaveApproval1 (4 days). LeaveRequest.status → PARTIALLY_APPROVED.
+
+Later HR approves Dec 8–9 (2 days) → LeaveApproval2. Now totalApproved = 6, remaining = 4.
+
+If totalApproved == requested later, status → APPROVED.
+
+Rejection example
+
+HR marks request as rejected → create LeaveApproval with rejected = true, approvedDays = 0, set resultingStatus = REJECTED. No balance updates.
+
+API & service design suggestions
+REST endpoints (suggested)
+
+POST /api/leaves — create leave (employee).
+
+GET /api/leaves?status=PENDING — HR views pending.
+
+GET /api/leaves/{id} — view detailed request + approvals.
+
+POST /api/leaves/{id}/approve — approve (partial/full) with approvedFrom, approvedTo, approvedDays, comment.
+
+POST /api/leaves/{id}/reject — reject.
+
+GET /api/employees/{id}/balances — view leave balances.
+
+POST /api/payroll/generate?year=YYYY&month=MM — generate payroll for all or single employee.
+
+Service classes
+
+LeaveRequestService — create request, fetch, validate.
+
+LeaveApprovalService — approve/reject, update balances.
+
+BalanceService — initialize balances at employee creation or start of year.
+
+PayrollService — collects approvals and generates SalarySlip.
+
+NotificationService — email/in-app push on changes.
+
+Edge cases & important business decisions
+
+Business days vs calendar days — pick one and be consistent. Include holidays.
+
+Half-days — support fractional requestedDays/approvedDays (use double).
+
+Cross-year requests — split approvedDays into the correct year when updating EmployeeLeaveBalance.
+
+Concurrent approvals — use optimistic locking and retry if balance updates conflict.
+
+Overdraw policy — decide whether employees can take more than allocated days and whether excess becomes unpaid automatically. Implement clear UI warnings.
+
+Per-day precision — if payroll needs exact dates (to tie to shift exceptions), use a LeaveDay entity.
+
+Audit & history — LeaveApproval already tracks who did what and when. Consider Envers or an audit table for full auditing.
+
+Notifications & SLA — notify employees and approvers; show history in UI.
+
+Cancellation & modification — support cancel requests; removing approved days should roll back EmployeeLeaveBalance.usedDays (transactionally).
+
+Manager approval flow — if you later need multi-level approvals (manager → HR), add approval sequence and state machine for LeaveRequest.
+
+Sample pseudo-code: approve (brief)
+@Transactional
+public void approveLeave(long leaveRequestId, ApproveDto dto, long approverId) {
+    LeaveRequest lr = leaveRequestRepo.findById(leaveRequestId)
+        .orElseThrow(...);
+    if (lr.getStatus() == LeaveStatus.APPROVED) throw new IllegalStateException();
+
+    LeaveApproval approval = new LeaveApproval();
+    approval.setApprover(employeeRepo.getOne(approverId));
+    approval.setApprovedFrom(dto.approvedFrom);
+    approval.setApprovedTo(dto.approvedTo);
+    approval.setApprovedDays(dto.approvedDays);
+    approval.setComment(dto.comment);
+    approval.setResultingStatus(determineResultingStatus(lr, dto.approvedDays));
+    approvalRepo.save(approval);
+
+    Map<Integer, Double> perYear = splitDaysByYear(dto.approvedFrom, dto.approvedTo);
+    for (entry : perYear) {
+       EmployeeLeaveBalance bal = balanceRepo.findOrCreate(lr.getEmployee(), entry.year, lr.getLeaveType());
+       if (policy.forbidOverdraw && bal.getRemainingDays() < entry.days) throw new BadRequest();
+       bal.setUsedDays(bal.getUsedDays() + entry.days);
+       balanceRepo.save(bal);
+    }
+
+    updateLeaveRequestStatus(lr);
+    leaveRequestRepo.save(lr);
+    notifyEmployee(lr.getEmployee(), approval);
+}
+
+Final tips
+
+Start by implementing request creation and a simple full-approve path (no partials). Make sure balances update correctly.
+
+Add partial approvals, per-day tracking, and payroll after the core flow is stable.
+
+Unit test: overlapping approvals, cross-year splits, concurrent approvals (simulate) and payroll edge cases (month boundary).
+
+Keep policy decisions (e.g., overdraw handling, holidays list) configurable.

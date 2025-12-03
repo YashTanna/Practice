@@ -1,0 +1,314 @@
+// Role.java
+package com.yourapp.model;
+
+public enum Role {
+    ADMIN,
+    HR,
+    EMPLOYEE
+}
+
+// LeaveType.java
+package com.yourapp.model;
+
+public enum LeaveType {
+    SICK,
+    CASUAL,
+    UNPAID
+}
+
+// LeaveStatus.java
+package com.yourapp.model;
+
+public enum LeaveStatus {
+    PENDING,
+    APPROVED,
+    REJECTED,
+    PARTIALLY_APPROVED,
+    CANCELLED
+}
+
+// Employee.java
+package com.yourapp.model;
+
+import javax.persistence.*;
+import java.time.LocalDateTime;
+import java.util.*;
+
+@Entity
+@Table(name = "employees")
+public class Employee {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable=false)
+    private String firstName;
+
+    private String lastName;
+
+    @Column(nullable=false, unique = true)
+    private String email;
+
+    @Column(nullable=false, unique = true)
+    private String employeeCode;
+
+    @Column(nullable=false)
+    private String passwordHash;
+
+    // ---- Roles as ENUM ----
+    @ElementCollection(fetch = FetchType.EAGER)
+    @Enumerated(EnumType.STRING)
+    @CollectionTable(
+            name = "employee_roles",
+            joinColumns = @JoinColumn(name = "employee_id")
+    )
+    @Column(name = "role")
+    private Set<Role> roles = new HashSet<>();
+
+    // ---- Leave Requests ----
+    @OneToMany(mappedBy = "employee", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<LeaveRequest> leaveRequests = new ArrayList<>();
+
+    // ---- Leave Balances ----
+    @OneToMany(mappedBy = "employee", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<EmployeeLeaveBalance> leaveBalances = new ArrayList<>();
+
+    @Column(nullable = false)
+    private LocalDateTime createdAt = LocalDateTime.now();
+
+    private LocalDateTime updatedAt;
+
+    @Version
+    private Long version;
+
+    public Employee() {}
+
+    public void addRole(Role role) {
+        roles.add(role);
+    }
+
+    // getters & setters ...
+}
+
+// EmployeeLeaveBalance.java
+package com.yourapp.model;
+
+import javax.persistence.*;
+
+@Entity
+@Table(name = "employee_leave_balances", uniqueConstraints = {
+        @UniqueConstraint(columnNames = {"employee_id", "year", "leave_type"})
+})
+public class EmployeeLeaveBalance {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(optional = false, fetch = FetchType.LAZY)
+    @JoinColumn(name = "employee_id")
+    private Employee employee;
+
+    @Column(nullable = false)
+    private int year;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "leave_type", nullable = false)
+    private LeaveType leaveType;
+
+    @Column(nullable = false)
+    private double allocatedDays;
+
+    @Column(nullable = false)
+    private double usedDays;
+
+    @Version
+    private Long version;
+
+    public EmployeeLeaveBalance() {}
+
+    public double getRemainingDays() {
+        return allocatedDays - usedDays;
+    }
+
+    // getters & setters ...
+}
+
+// LeaveRequest.java
+package com.yourapp.model;
+
+import javax.persistence.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
+
+@Entity
+@Table(name = "leave_requests")
+public class LeaveRequest {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(optional = false, fetch = FetchType.LAZY)
+    @JoinColumn(name = "employee_id")
+    private Employee employee;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private LeaveType leaveType;
+
+    @Column(nullable = false)
+    private LocalDate fromDate;
+
+    @Column(nullable = false)
+    private LocalDate toDate;
+
+    @Column(nullable = false)
+    private double requestedDays;
+
+    @Column(length = 2000)
+    private String reason;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private LeaveStatus status = LeaveStatus.PENDING;
+
+    @Column(length = 2000)
+    private String hrComment;
+
+    @OneToMany(mappedBy = "leaveRequest", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OrderBy("approvedAt ASC")
+    private List<LeaveApproval> approvals = new ArrayList<>();
+
+    @Column(nullable = false)
+    private LocalDateTime requestedAt = LocalDateTime.now();
+
+    private LocalDateTime updatedAt;
+
+    @Version
+    private Long version;
+
+    public LeaveRequest() {}
+
+    public double getTotalApprovedDays() {
+        return approvals.stream().mapToDouble(LeaveApproval::getApprovedDays).sum();
+    }
+
+    public double getRemainingDays() {
+        return requestedDays - getTotalApprovedDays();
+    }
+
+    public void addApproval(LeaveApproval approval) {
+        approval.setLeaveRequest(this);
+        approvals.add(approval);
+    }
+
+    // getters & setters ...
+}
+
+// LeaveApproval.java
+package com.yourapp.model;
+
+import javax.persistence.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "leave_approvals")
+public class LeaveApproval {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "approver_id")
+    private Employee approver;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "leave_request_id")
+    private LeaveRequest leaveRequest;
+
+    @Column(nullable = false)
+    private LocalDateTime approvedAt = LocalDateTime.now();
+
+    private LocalDate approvedFrom;
+    private LocalDate approvedTo;
+
+    @Column(nullable = false)
+    private double approvedDays;
+
+    @Column(nullable = false)
+    private boolean rejected = false;
+
+    @Column(length = 2000)
+    private String comment;
+
+    @Enumerated(EnumType.STRING)
+    private LeaveStatus resultingStatus;
+
+    @Version
+    private Long version;
+
+    public LeaveApproval() {}
+
+    // getters & setters ...
+}
+
+// SalarySlip.java
+package com.yourapp.model;
+
+import javax.persistence.*;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+@Entity
+@Table(name = "salary_slips", uniqueConstraints = {
+        @UniqueConstraint(columnNames = {"employee_id", "year", "month"})
+})
+public class SalarySlip {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(optional = false, fetch = FetchType.LAZY)
+    @JoinColumn(name = "employee_id")
+    private Employee employee;
+
+    @Column(nullable = false)
+    private int year;
+
+    @Column(nullable = false)
+    private int month;
+
+    @Column(nullable = false)
+    private double grossSalary;
+
+    private double paidLeaveDays;
+    private double unpaidLeaveDays;
+
+    private double deductions;
+
+    private double netSalary;
+
+    private LocalDateTime generatedAt = LocalDateTime.now();
+
+    @ManyToMany
+    @JoinTable(
+            name = "salary_slip_leave_requests",
+            joinColumns = @JoinColumn(name = "salary_slip_id"),
+            inverseJoinColumns = @JoinColumn(name = "leave_request_id")
+    )
+    private List<LeaveRequest> leaveRequests = new ArrayList<>();
+
+    @Version
+    private Long version;
+
+    public SalarySlip() {}
+
+    // getters & setters ...
+}
